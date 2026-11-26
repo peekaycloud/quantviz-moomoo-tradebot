@@ -249,6 +249,10 @@ export default function App() {
     setBusyAction(`tech:${ticker}`);
     try {
       const res = await fetch(`${API_BASE}/api/technicals/${encodeURIComponent(ticker)}?timeframe=${tf}`);
+      const ctype = res.headers.get('content-type') || '';
+      if (!ctype.includes('application/json')) {
+        throw new Error('Backend API unreachable (set VITE_API_URL in Vercel or use http://127.0.0.1:8000)');
+      }
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Failed to load technicals');
       setTechnicalsData(data);
