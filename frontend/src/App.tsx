@@ -41,7 +41,21 @@ import type {
 
 type TabKey = 'screener' | 'technicals' | 'portfolio' | 'advisor' | 'social' | 'backtest';
 
-const API_BASE = (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_URL?.replace(/\/$/, '') || '';
+const DEFAULT_API_BASE =
+  (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_URL?.replace(/\/$/, '') || '';
+
+function getApiBase(): string {
+  const saved = typeof window !== 'undefined' ? window.localStorage.getItem('TRADEBOT_API_URL') : null;
+  return (saved || DEFAULT_API_BASE).replace(/\/$/, '');
+}
+
+async function safeJson(res: Response) {
+  const ctype = res.headers.get('content-type') || '';
+  if (!ctype.includes('application/json')) {
+    throw new Error('Backend API unreachable — connect your local FastAPI server (ngrok / localhost:8000).');
+  }
+  return res.json();
+}
 
 const PIE_COLORS = ['#22c55e', '#38bdf8', '#a855f7', '#f59e0b', '#ec4899', '#14b8a6'];
 
@@ -142,6 +156,7 @@ export default function App() {
 
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [closingTickers, setClosingTickers] = useState<Record<string, boolean>>({});
+  const [customApiUrl, setCustomApiUrl] = useState<string>(() => getApiBase());
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
 
   const showToast = (kind: 'ok' | 'err', msg: string) => {
@@ -150,15 +165,16 @@ export default function App() {
   };
 
   const fetchAll = async () => {
+    const base = getApiBase();
     try {
       const [hRes, qRes, mRes, pRes, rRes, sRes, bRes] = await Promise.all([
-        fetch(`${API_BASE}/health`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/quotes`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/movers?limit=12`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/portfolio`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/recommendations`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/social?limit=80`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/backtests`).then((r) => r.json()),
+        fetch(`${base}/health`).then(safeJson),
+        fetch(`${base}/api/quotes`).then(safeJson),
+        fetch(`${base}/api/movers?limit=12`).then(safeJson),
+        fetch(`${base}/api/portfolio`).then(safeJson),
+        fetch(`${base}/api/recommendations`).then(safeJson),
+        fetch(`${base}/api/social?limit=80`).then(safeJson),
+        fetch(`${base}/api/backtests`).then(safeJson),
       ]);
       setMoomooMode(hRes.moomoo_mode || 'OFFLINE');
       setExecutionMode(hRes.execution_mode || 'SEMI_AUTO');
@@ -179,8 +195,9 @@ export default function App() {
 
   useEffect(() => {
     fetchAll();
-    const wsBase = API_BASE
-      ? API_BASE.replace(/^http/, 'ws')
+    const base = getApiBase();
+    const wsBase = base
+      ? base.replace(/^http/, 'ws')
       : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`;
     const ws = new WebSocket(`${wsBase}/ws/stream`);
     ws.onopen = () => setWsConnected(true);
@@ -218,7 +235,7 @@ export default function App() {
   }, []);
 
   const toggleMode = async (mode: 'SEMI_AUTO' | 'FULL_AUTO') => {
-    const res = await fetch(`${API_BASE}/api/settings/mode`, {
+    const res = await fetch(`${getApiBase()}/api/settings/mode`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode }),
@@ -232,8 +249,8 @@ export default function App() {
   const runResearch = async (ticker: string) => {
     setBusyAction(`research:${ticker}`);
     try {
-      const res = await fetch(`${API_BASE}/api/research/${encodeURIComponent(ticker)}`, { method: 'POST' });
-      const data = await res.json();
+      const res = await fetch(`${getApiBase()}/api/research/${encodeURIComponent(ticker)}`, { method: 'POST' });
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Research failed');
       showToast('ok', `${data.recommendation.ticker}: ${data.recommendation.verdict} (${data.recommendation.confidence}%)`);
       await fetchAll();
@@ -248,12 +265,12 @@ export default function App() {
   const loadTechnicals = async (ticker: string, tf: '1H' | '1D' | '1W' = techTimeframe) => {
     setBusyAction(`tech:${ticker}`);
     try {
-      const res = await fetch(`${API_BASE}/api/technicals/${encodeURIComponent(ticker)}?timeframe=${tf}`);
+      const res = await fetch(`${getApiBase()}/api/technicals/${encodeURIComponent(ticker)}?timeframe=${tf}`);
       const ctype = res.headers.get('content-type') || '';
       if (!ctype.includes('application/json')) {
         throw new Error('Backend API unreachable (set VITE_API_URL in Vercel or use http://127.0.0.1:8000)');
       }
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Failed to load technicals');
       setTechnicalsData(data);
     } catch (e: unknown) {
@@ -272,8 +289,8 @@ export default function App() {
   const scanTopMovers = async () => {
     setBusyAction('scan_movers');
     try {
-      const res = await fetch(`${API_BASE}/api/scan-movers?top_n=8`, { method: 'POST' });
-      const data = await res.json();
+      const res = await fetch(`${getApiBase()}/api/scan-movers?top_n=8`, { method: 'POST' });
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Mover scan failed');
       showToast('ok', `Scanned ${data.scanned_count} top high-moving stocks`);
       await fetchAll();
@@ -288,8 +305,8 @@ export default function App() {
   const approveRec = async (recId: string) => {
     setBusyAction(`exec:${recId}`);
     try {
-      const res = await fetch(`${API_BASE}/api/recommendations/${recId}/execute`, { method: 'POST' });
-      const data = await res.json();
+      const res = await fetch(`${getApiBase()}/api/recommendations/${recId}/execute`, { method: 'POST' });
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Execution rejected');
       showToast('ok', `Order ${data.order.order_id} (${data.order.side} ${data.order.qty} ${data.order.ticker}) -> ${data.order.status}`);
       await fetchAll();
@@ -304,7 +321,7 @@ export default function App() {
     e.preventDefault();
     setBusyAction('manual_order');
     try {
-      const res = await fetch(`${API_BASE}/api/orders`, {
+      const res = await fetch(`${getApiBase()}/api/orders`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -314,7 +331,7 @@ export default function App() {
           stop_loss: manualSide === 'BUY' ? manualSL : null,
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Order rejected');
       showToast('ok', `Order ${data.order.order_id} -> ${data.order.status}`);
       await fetchAll();
@@ -330,7 +347,7 @@ export default function App() {
     try {
       const side = pos.qty < 0 ? 'BUY' : 'SELL';
       const qty = Math.abs(pos.qty);
-      const res = await fetch(`${API_BASE}/api/orders`, {
+      const res = await fetch(`${getApiBase()}/api/orders`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -340,7 +357,7 @@ export default function App() {
           stop_loss: null,
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Close failed');
       showToast('ok', `Closed ${pos.symbol} (${side} ${qty}) — P&L booked in SIMULATE`);
       await fetchAll();
@@ -358,8 +375,8 @@ export default function App() {
   const closeAllPositions = async () => {
     setBusyAction('close_all');
     try {
-      const res = await fetch(`${API_BASE}/api/positions/close-all`, { method: 'POST' });
-      const data = await res.json();
+      const res = await fetch(`${getApiBase()}/api/positions/close-all`, { method: 'POST' });
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Close all failed');
       showToast('ok', `Submitted closing orders for ${data.closed_count} position(s) in SIMULATE`);
       await fetchAll();
@@ -373,8 +390,8 @@ export default function App() {
   const cancelOrder = async (orderId: string) => {
     setBusyAction(`cancel:${orderId}`);
     try {
-      const res = await fetch(`${API_BASE}/api/orders/${encodeURIComponent(orderId)}/cancel`, { method: 'POST' });
-      const data = await res.json();
+      const res = await fetch(`${getApiBase()}/api/orders/${encodeURIComponent(orderId)}/cancel`, { method: 'POST' });
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Cancel failed');
       showToast('ok', `Cancelled order ${orderId}`);
       await fetchAll();
@@ -388,8 +405,8 @@ export default function App() {
   const cancelAllOrders = async () => {
     setBusyAction('cancel_all');
     try {
-      const res = await fetch(`${API_BASE}/api/orders/cancel-all`, { method: 'POST' });
-      const data = await res.json();
+      const res = await fetch(`${getApiBase()}/api/orders/cancel-all`, { method: 'POST' });
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Cancel all failed');
       showToast('ok', `Cancelled ${data.cancelled_count} open order(s)`);
       await fetchAll();
@@ -404,7 +421,7 @@ export default function App() {
     e.preventDefault();
     setBusyAction('backtest');
     try {
-      const res = await fetch(`${API_BASE}/api/backtest`, {
+      const res = await fetch(`${getApiBase()}/api/backtest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -414,7 +431,7 @@ export default function App() {
           lookback_days: btDays,
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Backtest failed');
       showToast(data.passed_gatekeeper ? 'ok' : 'err', data.gatekeeper_reason);
       await fetchAll();
@@ -564,6 +581,31 @@ export default function App() {
           </button>
         ))}
       </nav>
+
+      {moomooMode === 'BACKEND_OFFLINE' && (
+        <div className="mx-4 mt-3 px-3 py-2 rounded border border-amber-700/60 bg-amber-950/40 text-xs font-mono flex flex-wrap items-center justify-between gap-2">
+          <span className="text-amber-200">
+            Backend offline. Run <code className="bg-black/40 px-1 rounded">ngrok http 8000</code> locally and paste the URL:
+          </span>
+          <div className="flex items-center gap-2">
+            <input
+              value={customApiUrl}
+              onChange={(e) => setCustomApiUrl(e.target.value)}
+              placeholder="https://xxxx.ngrok-free.app"
+              className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs w-64"
+            />
+            <button
+              onClick={() => {
+                window.localStorage.setItem('TRADEBOT_API_URL', customApiUrl.trim());
+                window.location.reload();
+              }}
+              className="px-2.5 py-1 rounded bg-sky-700 hover:bg-sky-600 text-white text-xs font-semibold"
+            >
+              Connect
+            </button>
+          </div>
+        </div>
+      )}
 
       {toast && (
         <div
