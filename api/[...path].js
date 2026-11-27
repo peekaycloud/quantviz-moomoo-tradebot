@@ -62,7 +62,7 @@ async function fetchYahooChart(symbol, range = '1y', interval = '1d') {
     }
   }
   const price = Number(meta.regularMarketPrice || bars[bars.length - 1]?.close || 100);
-  const prevClose = Number(meta.chartPreviousClose || meta.previousClose || price);
+  const prevClose = Number(meta.previousClose || meta.chartPreviousClose || price);
   const chgPct = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
   return {
     quote: {

@@ -169,7 +169,7 @@ export default function App() {
     const base = getApiBase();
     try {
       const [hRes, qRes, mRes, pRes, rRes, sRes, bRes] = await Promise.all([
-        fetch(`${base}/health`).then(safeJson),
+        fetch(`${base}/api/health`).then(safeJson),
         fetch(`${base}/api/quotes`).then(safeJson),
         fetch(`${base}/api/movers?limit=12`).then(safeJson),
         fetch(`${base}/api/portfolio`).then(safeJson),
