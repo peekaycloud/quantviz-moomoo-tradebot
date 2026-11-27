@@ -171,7 +171,7 @@ class SocialResearchOrchestrator:
         items: list[SocialItem] = []
         reddit_headers = {"User-Agent": "TradeBotQuantResearch/1.0 (by /u/quant_researcher)"}
 
-        async with httpx.AsyncClient(headers=reddit_headers, timeout=10.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(headers=reddit_headers, timeout=4.0, follow_redirects=True) as client:
             tasks = [
                 client.get(
                     f"https://www.reddit.com/r/{sub}/search.json",
@@ -324,7 +324,7 @@ class SocialResearchOrchestrator:
             ("google_news", f"https://news.google.com/rss/search?q={sym}+stock+earnings&hl=en-US&gl=US&ceid=US:en"),
         ]
 
-        async with httpx.AsyncClient(headers=self._headers, timeout=10.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(headers=self._headers, timeout=4.0, follow_redirects=True) as client:
             tasks = [client.get(url) for _, url in rss_urls]
             # SEC EDGAR full-text search for recent 8-K / 10-Q filings
             sec_headers = {"User-Agent": self.settings.sec_edgar_user_agent}
@@ -391,13 +391,20 @@ class SocialResearchOrchestrator:
         return items
 
     async def gather_ticker_intelligence(self, ticker: str) -> dict[str, Any]:
-        """Run all 4 login-free research skills concurrently, deduplicate, and aggregate scores."""
+        """Run all 4 login-free research skills concurrently with strict 5s timeouts."""
         sym = strip_market_prefix(ticker)
+
+        async def _safe(coro: Any) -> list[SocialItem]:
+            try:
+                return await asyncio.wait_for(coro, timeout=5.0)
+            except Exception:
+                return []
+
         reddit, x_threads, li_ig, news_sec = await asyncio.gather(
-            self.fetch_reddit(sym),
-            self.fetch_x_and_threads(sym),
-            self.fetch_linkedin_and_instagram(sym),
-            self.fetch_news_and_sec(sym),
+            _safe(self.fetch_reddit(sym)),
+            _safe(self.fetch_x_and_threads(sym)),
+            _safe(self.fetch_linkedin_and_instagram(sym)),
+            _safe(self.fetch_news_and_sec(sym)),
         )
         raw_items = reddit + x_threads + li_ig + news_sec
         clean_items = deduplicate_items(raw_items)

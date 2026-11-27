@@ -140,6 +140,7 @@ export default function App() {
   const [backtests, setBacktests] = useState<BacktestRun[]>([]);
 
   const [searchTicker, setSearchTicker] = useState('US.MU');
+  const [bulkTickers, setBulkTickers] = useState('');
   const [techTicker, setTechTicker] = useState('US.MU');
   const [techTimeframe, setTechTimeframe] = useState<'1H' | '1D' | '1W'>('1D');
   const [technicalsData, setTechnicalsData] = useState<TradingViewTechnicals | null>(null);
@@ -286,10 +287,62 @@ export default function App() {
     }
   }, [tab, techTicker, techTimeframe]);
 
+  const refreshPortfolioOnly = async () => {
+    const base = getApiBase();
+    const pRes = await fetch(`${base}/api/portfolio`).then(safeJson);
+    setAccount(pRes.account || null);
+    setPositions(pRes.positions || []);
+    setOrders(pRes.orders || []);
+    setNavHistory(pRes.nav_history || []);
+    setCircuitBreaker(Boolean(pRes.circuit_breaker_tripped));
+  };
+
+  const addMultipleStocks = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!bulkTickers.trim()) return;
+    setBusyAction('add_stocks');
+    try {
+      const res = await fetch(`${getApiBase()}/api/watchlist/add`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tickers: bulkTickers }),
+      });
+      const data = await safeJson(res);
+      if (!res.ok) throw new Error(data.detail || 'Failed to add stocks');
+      setQuotes(data.quotes || []);
+      setBulkTickers('');
+      showToast('ok', `Added ${data.added.length ? data.added.join(', ') : 'watchlist'} immediately`);
+    } catch (err: unknown) {
+      showToast('err', err instanceof Error ? err.message : 'Failed to add stocks');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const scanAllWatchlist = async () => {
+    setBusyAction('scan_all');
+    try {
+      const res = await fetch(`${getApiBase()}/api/scan-batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = await safeJson(res);
+      if (!res.ok) throw new Error(data.detail || 'Batch scan failed');
+      showToast('ok', `Scanned ${data.scanned_count} watchlist stocks`);
+      await fetchAll();
+      setTab('advisor');
+    } catch (err: unknown) {
+      showToast('err', err instanceof Error ? err.message : 'Batch scan failed');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const scanTopMovers = async () => {
     setBusyAction('scan_movers');
     try {
-      const res = await fetch(`${getApiBase()}/api/scan-movers?top_n=8`, { method: 'POST' });
+      const res = await fetch(`${getApiBase()}/api/scan-movers?top_n=10`, { method: 'POST' });
       const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Mover scan failed');
       showToast('ok', `Scanned ${data.scanned_count} top high-moving stocks`);
@@ -309,7 +362,7 @@ export default function App() {
       const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Execution rejected');
       showToast('ok', `Order ${data.order.order_id} (${data.order.side} ${data.order.qty} ${data.order.ticker}) -> ${data.order.status}`);
-      await fetchAll();
+      await refreshPortfolioOnly();
     } catch (e: unknown) {
       showToast('err', e instanceof Error ? e.message : 'Order rejected');
     } finally {
@@ -360,7 +413,7 @@ export default function App() {
       const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Close failed');
       showToast('ok', `Closed ${pos.symbol} (${side} ${qty}) — P&L booked in SIMULATE`);
-      await fetchAll();
+      await refreshPortfolioOnly();
     } catch (err: unknown) {
       showToast('err', err instanceof Error ? err.message : 'Close failed');
     } finally {
@@ -379,7 +432,7 @@ export default function App() {
       const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Close all failed');
       showToast('ok', `Submitted closing orders for ${data.closed_count} position(s) in SIMULATE`);
-      await fetchAll();
+      await refreshPortfolioOnly();
     } catch (err: unknown) {
       showToast('err', err instanceof Error ? err.message : 'Close all failed');
     } finally {
@@ -394,7 +447,7 @@ export default function App() {
       const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Cancel failed');
       showToast('ok', `Cancelled order ${orderId}`);
-      await fetchAll();
+      await refreshPortfolioOnly();
     } catch (err: unknown) {
       showToast('err', err instanceof Error ? err.message : 'Cancel failed');
     } finally {
@@ -409,7 +462,7 @@ export default function App() {
       const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Cancel all failed');
       showToast('ok', `Cancelled ${data.cancelled_count} open order(s)`);
-      await fetchAll();
+      await refreshPortfolioOnly();
     } catch (err: unknown) {
       showToast('err', err instanceof Error ? err.message : 'Cancel all failed');
     } finally {
@@ -502,7 +555,15 @@ export default function App() {
             disabled={busyAction !== null}
             className="bg-sky-700 hover:bg-sky-600 disabled:opacity-50 text-white px-2.5 py-1 rounded text-xs font-medium whitespace-nowrap"
           >
-            {busyAction === 'scan_movers' ? 'Scanning Movers...' : 'Scan Top 8 Movers'}
+            {busyAction === 'scan_movers' ? 'Scanning Movers...' : 'Scan Top 10 Movers'}
+          </button>
+
+          <button
+            onClick={scanAllWatchlist}
+            disabled={busyAction !== null}
+            className="bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 text-white px-2.5 py-1 rounded text-xs font-medium whitespace-nowrap"
+          >
+            {busyAction === 'scan_all' ? 'Scanning All...' : 'Scan All Watchlist'}
           </button>
 
           <div className="flex rounded border border-[#30363d] overflow-hidden text-[11px] font-mono">
@@ -655,11 +716,25 @@ export default function App() {
             </section>
 
             <section className="lg:col-span-7 border border-[#30363d] rounded bg-[#161b22] overflow-hidden">
-              <div className="px-3 py-2 border-b border-[#30363d] flex items-center justify-between">
+              <div className="px-3 py-2 border-b border-[#30363d] flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                  Finviz-Style Quant Screener
+                  Finviz-Style Quant Screener ({quotes.length})
                 </h2>
-                <span className="text-[11px] text-slate-400 font-mono">{quotes.length} symbols</span>
+                <form onSubmit={addMultipleStocks} className="flex items-center gap-1.5">
+                  <input
+                    value={bulkTickers}
+                    onChange={(e) => setBulkTickers(e.target.value.toUpperCase())}
+                    placeholder="Add multiple: MU, TSM, ASML, COIN"
+                    className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-[11px] font-mono w-56 focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    disabled={busyAction === 'add_stocks'}
+                    className="px-2.5 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white text-[11px] font-semibold whitespace-nowrap"
+                  >
+                    {busyAction === 'add_stocks' ? 'Adding...' : '+ Add Stocks'}
+                  </button>
+                </form>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse font-mono text-xs">

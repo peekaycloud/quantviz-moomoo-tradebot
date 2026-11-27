@@ -48,6 +48,14 @@ class ModeRequest(BaseModel):
     mode: str
 
 
+class WatchlistAddRequest(BaseModel):
+    tickers: str
+
+
+class BatchScanRequest(BaseModel):
+    tickers: list[str] | None = None
+
+
 class BotRuntime:
     """Shared runtime state across FastAPI routes and background tasks."""
 
@@ -59,6 +67,7 @@ class BotRuntime:
         self.researcher = SocialResearchOrchestrator(self.settings)
         self.advisor = AIAdvisor(self.settings)
         self.risk = RiskManager(self.settings)
+        self.watchlist: list[str] = list(self.settings.watchlist_symbols)
         self.ws_clients: set[WebSocket] = set()
         self._poll_task: asyncio.Task[None] | None = None
 
@@ -80,8 +89,20 @@ class BotRuntime:
             try:
                 positions, quotes = await asyncio.gather(
                     asyncio.to_thread(self.moomoo.get_positions),
-                    asyncio.to_thread(self.moomoo.get_live_quotes, self.settings.watchlist_symbols),
+                    asyncio.to_thread(self.moomoo.get_live_quotes, self.watchlist),
                 )
+                quote_map = {q["ticker"]: float(q["price"]) for q in quotes if float(q.get("price", 0.0)) > 0}
+                for p in positions:
+                    live_px = quote_map.get(p["ticker"])
+                    if live_px and p.get("avg_cost"):
+                        qty = float(p["qty"])
+                        avg = float(p["avg_cost"])
+                        p["current_price"] = round(live_px, 4)
+                        p["market_value"] = round(qty * live_px, 2)
+                        pnl = (live_px - avg) * qty
+                        p["unrealized_pnl"] = round(pnl, 2)
+                        p["unrealized_pnl_pct"] = round((pnl / (abs(qty) * avg)) * 100.0, 2)
+
                 account = await asyncio.to_thread(self.moomoo.get_account_info, positions)
                 await asyncio.to_thread(self.db.record_portfolio_snapshot, account)
 
@@ -96,7 +117,7 @@ class BotRuntime:
                 await self._broadcast(payload)
             except Exception as exc:
                 logger.debug("Background poll error: %s", exc)
-            await asyncio.sleep(self.settings.poll_interval_seconds)
+            await asyncio.sleep(min(self.settings.poll_interval_seconds, 1.5))
 
     async def _broadcast(self, message: dict[str, Any]) -> None:
         stale: list[WebSocket] = []
@@ -220,7 +241,7 @@ SP500_HIGH_MOVERS_UNIVERSE = [
 @app.get("/api/quotes")
 def get_quotes() -> dict[str, Any]:
     positions = runtime.moomoo.get_positions()
-    tickers = list(dict.fromkeys(runtime.settings.watchlist_symbols + [p["ticker"] for p in positions]))
+    tickers = list(dict.fromkeys(runtime.watchlist + [p["ticker"] for p in positions]))
     quotes = runtime.moomoo.get_live_quotes(tickers)
     recs = {strip_market_prefix(r["ticker"]): r for r in runtime.db.get_recommendations(limit=50)}
     for q in quotes:
@@ -229,6 +250,28 @@ def get_quotes() -> dict[str, Any]:
         q["ai_confidence"] = rec["confidence"] if rec else 50.0
         q["social_score"] = rec["social_score"] if rec else 0.0
     return {"quotes": quotes}
+
+
+@app.post("/api/watchlist/add")
+def add_watchlist_tickers(req: WatchlistAddRequest) -> dict[str, Any]:
+    """Add one or multiple comma/space-separated tickers to the live watchlist immediately."""
+    raw_tokens = [t.strip() for t in req.tickers.replace("\n", ",").replace(" ", ",").split(",") if t.strip()]
+    added: list[str] = []
+    for tok in raw_tokens:
+        code = normalize_ticker(tok)
+        if code not in runtime.watchlist:
+            runtime.watchlist.append(code)
+            added.append(code)
+    quotes = get_quotes()["quotes"]
+    return {"added": added, "watchlist": runtime.watchlist, "quotes": quotes}
+
+
+@app.delete("/api/watchlist/{ticker}")
+def remove_watchlist_ticker(ticker: str) -> dict[str, Any]:
+    """Remove a ticker from the live watchlist."""
+    code = normalize_ticker(ticker)
+    runtime.watchlist = [t for t in runtime.watchlist if t != code]
+    return {"removed": code, "watchlist": runtime.watchlist}
 
 
 @app.get("/api/movers")
@@ -269,11 +312,32 @@ async def get_tradingview_technicals(ticker: str, timeframe: str = "1D") -> dict
 
 
 @app.post("/api/scan-movers")
-async def scan_top_movers(top_n: int = 8) -> dict[str, Any]:
+async def scan_top_movers(top_n: int = 10) -> dict[str, Any]:
     """Run AI Research & Signal generation across the top N high-moving stocks."""
     movers_data = await asyncio.to_thread(get_high_movers, top_n)
     top_tickers = [m["ticker"] for m in movers_data["movers"]]
-    results = await asyncio.gather(*(run_research_and_signal(t) for t in top_tickers), return_exceptions=True)
+    sem = asyncio.Semaphore(6)
+
+    async def _bounded(t: str) -> Any:
+        async with sem:
+            return await run_research_and_signal(t)
+
+    results = await asyncio.gather(*(_bounded(t) for t in top_tickers), return_exceptions=True)
+    scanned = [r["recommendation"] for r in results if isinstance(r, dict) and "recommendation" in r]
+    return {"scanned_count": len(scanned), "recommendations": scanned}
+
+
+@app.post("/api/scan-batch")
+async def scan_batch_tickers(req: BatchScanRequest) -> dict[str, Any]:
+    """Scan all watchlist tickers (or a custom list) concurrently for AI recommendations."""
+    targets = [normalize_ticker(t) for t in (req.tickers or runtime.watchlist)][:25]
+    sem = asyncio.Semaphore(6)
+
+    async def _bounded(t: str) -> Any:
+        async with sem:
+            return await run_research_and_signal(t)
+
+    results = await asyncio.gather(*(_bounded(t) for t in targets), return_exceptions=True)
     scanned = [r["recommendation"] for r in results if isinstance(r, dict) and "recommendation" in r]
     return {"scanned_count": len(scanned), "recommendations": scanned}
 
