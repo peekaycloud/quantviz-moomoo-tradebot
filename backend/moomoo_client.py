@@ -10,6 +10,7 @@ import json
 import logging
 import socket
 import subprocess
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +127,11 @@ class MoomooPaperClient:
         self._trade_ctx: Any = None
         self.connected: bool = False
         self.mode: str = "DISCONNECTED"
+        # Moomoo cloud API rate-limits (HTTP 439) bursts of concurrent CLI calls.
+        self._cli_sem = threading.Semaphore(2)
+        self._last_good_positions: list[dict[str, Any]] | None = None
+        self._last_good_account: dict[str, Any] | None = None
+        self._last_good_orders: list[dict[str, Any]] | None = None
 
         # Local sandbox fallback state (used only when OpenD gateway is offline)
         self._sim_cash: float = 100_000.0
@@ -148,7 +154,8 @@ class MoomooPaperClient:
     def _run_moomoo_cli(self, args: list[str], timeout: float = 15.0) -> Any:
         """Execute ~/.moomoo/bin/moomoo with --format json and parse output."""
         cmd = [self.cli_bin, *args, "--format", "json"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        with self._cli_sem:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or "").strip() or f"CLI exited {proc.returncode}")
         return json.loads(proc.stdout)
@@ -375,7 +382,7 @@ class MoomooPaperClient:
                 unrealized = sum(p["unrealized_pnl"] for p in positions)
                 day_pnl = nav - 100_000.0
                 realized = day_pnl - unrealized
-                return {
+                account = {
                     "trd_env": "SIMULATE",
                     "mode": self.mode,
                     "account_id": self.sim_account_id,
@@ -387,8 +394,12 @@ class MoomooPaperClient:
                     "day_pnl": round(day_pnl, 2),
                     "day_pnl_pct": round((day_pnl / 100_000.0 * 100.0), 2),
                 }
+                self._last_good_account = account
+                return account
             except Exception as exc:
                 logger.warning("Moomoo CLI funds error: %s", exc)
+                if self._last_good_account is not None:
+                    return self._last_good_account
 
         # Local fallback calculation
         positions = positions_override if positions_override is not None else self.get_positions()
@@ -451,6 +462,7 @@ class MoomooPaperClient:
                     else []
                 )
                 if not pos_list:
+                    self._last_good_positions = []
                     return []
                 total_mkt = sum(abs(float(p.get("mv", p.get("market_val", 0.0)) or 0.0)) for p in pos_list) or 1.0
                 positions = []
@@ -477,9 +489,12 @@ class MoomooPaperClient:
                             "unrealized_pnl_pct": round(pnl_ratio, 2),
                         }
                     )
+                self._last_good_positions = positions
                 return positions
             except Exception as exc:
                 logger.warning("Moomoo CLI positions error: %s", exc)
+                if self._last_good_positions is not None:
+                    return self._last_good_positions
 
         # Local fallback positions
         total_equity = self._sim_cash + sum(
@@ -512,6 +527,80 @@ class MoomooPaperClient:
             )
         return result
 
+    @staticmethod
+    def _cli_order_entries(src: Any) -> list[dict[str, Any]]:
+        if isinstance(src, list):
+            return src
+        if not isinstance(src, dict):
+            return []
+        inner = src.get("data") if isinstance(src.get("data"), dict) else src
+        return inner.get("orders", inner.get("list", [])) or []
+
+    @staticmethod
+    def _normalize_cli_order(o: dict[str, Any]) -> dict[str, Any]:
+        status_map = {1: "UNSUBMITTED", 2: "OPEN", 3: "CANCELLED", 4: "FILLED", 5: "FAILED"}
+        sym_raw = str(o.get("symbol", o.get("code", "")))
+        side_val = o.get("side", o.get("trd_side"))
+        raw_status = o.get("status", o.get("order_status", ""))
+        ts_us = int(o.get("create_time", o.get("updated_time", 0)) or 0)
+        fill_px = float(o.get("avg_fill_price") or 0.0)
+        return {
+            "order_id": str(o.get("order_id", o.get("orderId", ""))),
+            "ts": datetime.fromtimestamp(ts_us / 1e6).strftime("%Y-%m-%d %H:%M:%S") if ts_us else "",
+            "ts_us": ts_us,
+            "ticker": normalize_ticker(sym_raw) if sym_raw else "",
+            "side": "BUY" if side_val in (1, "BUY") else "SELL",
+            "qty": float(o.get("qty", 0.0) or 0.0),
+            "filled_qty": float(o.get("cum_qty", 0.0) or 0.0),
+            "price": round(fill_px or float(o.get("price") or 0.0), 4),
+            "fill_price": round(fill_px, 4),
+            "order_type": "LIMIT" if o.get("order_type") == 1 else "MARKET",
+            "status": status_map.get(raw_status, str(raw_status)),
+            "trd_env": "SIMULATE",
+        }
+
+    def get_order_history(self, page_size: int = 100, max_pages: int = 40) -> list[dict[str, Any]]:
+        """Full simulated order history across all sessions, newest first."""
+        assert_simulate_env(self.trd_env)
+        if self.connected and self._trade_ctx is not None:
+            try:
+                ret, df = self._trade_ctx.history_order_list_query(
+                    start="2020-01-01",
+                    end=datetime.now().strftime("%Y-%m-%d"),
+                    trd_env=assert_simulate_env(TrdEnv.SIMULATE),
+                )
+                if ret == RET_OK and isinstance(df, pd.DataFrame) and not df.empty:
+                    return df.to_dict(orient="records")
+            except Exception as exc:
+                logger.warning("OpenD history_order_list_query error: %s", exc)
+            return self.get_orders()
+        if self.mode == "MOOMOO_CLI_SIMULATE":
+            items: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            next_key = ""
+            for _ in range(max_pages):
+                args = [
+                    "sim", "order", "history",
+                    "--account", self.sim_account_id,
+                    "--market", self.settings.moomoo_trd_market,
+                    "--page-size", str(page_size),
+                ]
+                if next_key:
+                    args += ["--next-key", next_key]
+                src = self._run_moomoo_cli(args, timeout=30.0)
+                for o in self._cli_order_entries(src):
+                    item = self._normalize_cli_order(o)
+                    if item["order_id"] not in seen:
+                        seen.add(item["order_id"])
+                        items.append(item)
+                pag = src.get("pagination", {}) if isinstance(src, dict) else {}
+                if not pag.get("has_more") or not pag.get("next_key"):
+                    break
+                next_key = str(pag["next_key"])
+            items.sort(key=lambda x: x["ts_us"], reverse=True)
+            return items
+        return list(reversed(self._sim_orders))
+
     def get_orders(self) -> list[dict[str, Any]]:
         """Query simulated order blotter."""
         assert_simulate_env(self.trd_env)
@@ -521,48 +610,35 @@ class MoomooPaperClient:
                 return df.to_dict(orient="records")
         if self.mode == "MOOMOO_CLI_SIMULATE":
             try:
-                open_orders = self._run_moomoo_cli(
-                    ["sim", "order", "list", "--account", self.sim_account_id, "--market", self.settings.moomoo_trd_market]
-                )
-                hist_orders = self._run_moomoo_cli(
-                    ["sim", "order", "history", "--account", self.sim_account_id, "--market", self.settings.moomoo_trd_market]
-                )
-                status_map = {1: "UNSUBMITTED", 2: "OPEN", 3: "CANCELLED", 4: "FILLED", 5: "FAILED"}
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    open_fut = pool.submit(
+                        self._run_moomoo_cli,
+                        ["sim", "order", "list", "--account", self.sim_account_id, "--market", self.settings.moomoo_trd_market],
+                    )
+                    hist_fut = pool.submit(
+                        self._run_moomoo_cli,
+                        ["sim", "order", "history", "--account", self.sim_account_id, "--market", self.settings.moomoo_trd_market],
+                    )
+                    open_orders = open_fut.result()
+                    hist_orders = hist_fut.result()
                 items: list[dict[str, Any]] = []
                 seen_ids: set[str] = set()
                 for src in (open_orders, hist_orders):
-                    entries = (
-                        src
-                        if isinstance(src, list)
-                        else src.get("orders", src.get("list", []))
-                        if isinstance(src, dict)
-                        else []
-                    )
-                    for o in entries:
-                        oid = str(o.get("order_id", o.get("orderId", "")))
-                        if oid in seen_ids:
+                    for o in self._cli_order_entries(src):
+                        item = self._normalize_cli_order(o)
+                        if item["order_id"] in seen_ids:
                             continue
-                        seen_ids.add(oid)
-                        sym_raw = str(o.get("symbol", o.get("code", "")))
-                        side_val = o.get("side", o.get("trd_side"))
-                        raw_status = o.get("status", o.get("order_status", ""))
-                        px = float(o.get("avg_fill_price") or o.get("price") or 0.0)
-                        items.append(
-                            {
-                                "order_id": oid,
-                                "ts": str(o.get("create_time", o.get("updated_time", ""))),
-                                "ticker": normalize_ticker(sym_raw) if sym_raw else "",
-                                "side": "BUY" if side_val in (1, "BUY") else "SELL",
-                                "qty": float(o.get("qty", 0.0) or 0.0),
-                                "price": round(px, 4),
-                                "order_type": "LIMIT" if o.get("order_type") == 1 else "MARKET",
-                                "status": status_map.get(raw_status, str(raw_status)),
-                                "trd_env": "SIMULATE",
-                            }
-                        )
+                        seen_ids.add(item["order_id"])
+                        items.append(item)
+                items.sort(key=lambda x: x["ts_us"], reverse=True)
+                self._last_good_orders = items
                 return items
             except Exception as exc:
                 logger.warning("Moomoo CLI orders error: %s", exc)
+                if self._last_good_orders is not None:
+                    return self._last_good_orders
         return list(reversed(self._sim_orders))
 
     def get_deals(self) -> list[dict[str, Any]]:
@@ -625,41 +701,42 @@ class MoomooPaperClient:
             }
 
         if self.mode == "MOOMOO_CLI_SIMULATE":
-            # Use live quote price for limit order if price <= 0
-            limit_px = float(price)
-            if limit_px <= 0:
+            is_market = order_type.upper() == "MARKET" or price <= 0
+            ref_px = float(price)
+            if ref_px <= 0:
+                ref_px = float(self._last_prices.get(code, 0.0))
+            if ref_px <= 0 and not is_market:
                 q = self.get_live_quotes([code])
-                limit_px = float(q[0]["price"]) if q else self._last_prices.get(code, 100.0)
-            res = self._run_moomoo_cli(
-                [
-                    "sim",
-                    "order",
-                    "place",
-                    str(int(qty)),
-                    "--symbol",
-                    code,
-                    "--side",
-                    side_upper,
-                    "--account",
-                    self.sim_account_id,
-                    "--market",
-                    self.settings.moomoo_trd_market,
-                    "--type",
-                    "limit",
-                    "--price",
-                    f"{limit_px:.2f}",
-                    "--session",
-                    "RTH",
-                ]
-            )
+                ref_px = float(q[0]["price"]) if q else 100.0
+            args = [
+                "sim",
+                "order",
+                "place",
+                str(int(qty)),
+                "--symbol",
+                code,
+                "--side",
+                side_upper,
+                "--account",
+                self.sim_account_id,
+                "--market",
+                self.settings.moomoo_trd_market,
+            ]
+            if is_market:
+                # True market order fills immediately; a limit at the last price
+                # sits queued and never fills outside RTH.
+                args += ["--type", "market"]
+            else:
+                args += ["--type", "limit", "--price", f"{ref_px:.2f}"]
+            res = self._run_moomoo_cli(args)
             order_id = str(res.get("orderId", res.get("order_id", uuid.uuid4().hex[:10]))) if isinstance(res, dict) else uuid.uuid4().hex[:10]
             return {
                 "order_id": order_id,
                 "ticker": code,
                 "side": side_upper,
                 "qty": float(int(qty)),
-                "price": round(limit_px, 2),
-                "order_type": "LIMIT",
+                "price": round(ref_px, 2),
+                "order_type": "MARKET" if is_market else "LIMIT",
                 "status": "SUBMITTED_MOOMOO_SIM",
                 "trd_env": "SIMULATE",
                 "stop_loss": stop_loss,

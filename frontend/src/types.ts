@@ -51,6 +51,9 @@ export interface OrderItem {
   trd_env: string;
   stop_loss?: number | null;
   take_profit?: number | null;
+  filled_qty?: number;
+  fill_price?: number;
+  ts_us?: number;
 }
 
 export interface RecommendationItem {

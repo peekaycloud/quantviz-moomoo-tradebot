@@ -134,6 +134,8 @@ export default function App() {
   const [account, setAccount] = useState<AccountInfo | null>(null);
   const [positions, setPositions] = useState<PositionItem[]>([]);
   const [orders, setOrders] = useState<OrderItem[]>([]);
+  const [tradeHistory, setTradeHistory] = useState<OrderItem[] | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [navHistory, setNavHistory] = useState<Array<{ ts: string; nav: number }>>([]);
   const [recommendations, setRecommendations] = useState<RecommendationItem[]>([]);
   const [socialItems, setSocialItems] = useState<SocialFeedItem[]>([]);
@@ -163,6 +165,41 @@ export default function App() {
   const showToast = (kind: 'ok' | 'err', msg: string) => {
     setToast({ kind, msg });
     setTimeout(() => setToast(null), 5000);
+  };
+
+  const fetchTradeHistory = async () => {
+    setHistoryLoading(true);
+    try {
+      const res = await fetch(`${getApiBase()}/api/trade-history`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await safeJson(res);
+      setTradeHistory(data.orders || []);
+    } catch {
+      showToast('err', 'Failed to load full trade history.');
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (tab === 'backtest' && tradeHistory === null && !historyLoading) fetchTradeHistory();
+  }, [tab, tradeHistory, historyLoading]);
+
+  const exportTradeHistory = () => {
+    if (!tradeHistory || tradeHistory.length === 0) return;
+    const header = ['time', 'order_id', 'ticker', 'side', 'qty', 'filled_qty', 'fill_price', 'order_type', 'status'];
+    const rows = tradeHistory.map((o) => [
+      o.ts, o.order_id, o.ticker, o.side, o.qty, o.filled_qty ?? 0, o.fill_price ?? '', o.order_type, o.status,
+    ]);
+    const csv = [header, ...rows]
+      .map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(','))
+      .join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `tradebot_trade_history_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const fetchAll = async () => {
@@ -216,6 +253,7 @@ export default function App() {
             ]);
           }
           if (msg.positions) setPositions(msg.positions);
+          if (msg.orders) setOrders(msg.orders);
           if (msg.quotes) {
             setQuotes((prev) => {
               const prevMap = new Map(prev.map((p) => [p.symbol, p]));
@@ -387,7 +425,7 @@ export default function App() {
       const data = await safeJson(res);
       if (!res.ok) throw new Error(data.detail || 'Order rejected');
       showToast('ok', `Order ${data.order.order_id} -> ${data.order.status}`);
-      await fetchAll();
+      await refreshPortfolioOnly();
     } catch (err: unknown) {
       showToast('err', err instanceof Error ? err.message : 'Order failed');
     } finally {
@@ -504,7 +542,7 @@ export default function App() {
   }, [socialItems, socialFilter]);
 
   const openOrders = useMemo(
-    () => orders.filter((o) => ['OPEN', 'SUBMITTED', 'UNSUBMITTED'].includes(String(o.status).toUpperCase())),
+    () => orders.filter((o) => ['OPEN', 'SUBMITTED', 'SUBMITTED_MOOMOO_SIM', 'UNSUBMITTED'].includes(String(o.status).toUpperCase())),
     [orders]
   );
 
@@ -1529,6 +1567,68 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            <div className="border border-[#30363d] rounded bg-[#161b22] overflow-hidden">
+              <div className="px-3 py-2 border-b border-[#30363d] text-xs font-semibold uppercase text-slate-300 flex items-center justify-between">
+                <span>Full Trade History — {tradeHistory ? tradeHistory.length : 0} orders (all sessions)</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={exportTradeHistory}
+                    disabled={!tradeHistory || tradeHistory.length === 0}
+                    className="px-2 py-0.5 rounded border border-[#30363d] text-[11px] text-slate-300 hover:bg-[#21262d] disabled:opacity-50"
+                  >
+                    Export CSV
+                  </button>
+                  <button
+                    onClick={fetchTradeHistory}
+                    disabled={historyLoading}
+                    className="px-2 py-0.5 rounded border border-[#30363d] text-[11px] text-slate-300 hover:bg-[#21262d] disabled:opacity-50"
+                  >
+                    {historyLoading ? 'Loading…' : 'Refresh'}
+                  </button>
+                </div>
+              </div>
+              <div className="max-h-[420px] overflow-auto">
+                <table className="w-full text-left font-mono text-xs">
+                  <thead className="sticky top-0 bg-[#0d1117]">
+                    <tr className="text-slate-400 border-b border-[#30363d]">
+                      <th className="py-2 px-3">Time</th>
+                      <th className="py-2 px-3">Order ID</th>
+                      <th className="py-2 px-3">Ticker</th>
+                      <th className="py-2 px-3">Side</th>
+                      <th className="py-2 px-3 text-right">Qty</th>
+                      <th className="py-2 px-3 text-right">Filled</th>
+                      <th className="py-2 px-3 text-right">Fill Price</th>
+                      <th className="py-2 px-3">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {!tradeHistory || tradeHistory.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="py-6 text-center text-slate-500">
+                          {historyLoading ? 'Loading full history…' : 'No trade history.'}
+                        </td>
+                      </tr>
+                    ) : (
+                      tradeHistory.map((o) => (
+                        <tr key={o.order_id} className="border-b border-[#21262d]">
+                          <td className="py-1.5 px-3 text-slate-400">{o.ts}</td>
+                          <td className="py-1.5 px-3 text-slate-300">{o.order_id}</td>
+                          <td className="py-1.5 px-3 font-bold text-sky-400">{o.ticker}</td>
+                          <td className={`py-1.5 px-3 font-bold ${o.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {o.side}
+                          </td>
+                          <td className="py-1.5 px-3 text-right">{o.qty}</td>
+                          <td className="py-1.5 px-3 text-right">{o.filled_qty ?? 0}</td>
+                          <td className="py-1.5 px-3 text-right">{o.fill_price ? `$${o.fill_price.toFixed(2)}` : '—'}</td>
+                          <td className="py-1.5 px-3">{o.status}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
 
             <div className="border border-[#30363d] rounded bg-[#161b22] overflow-hidden">
               <div className="px-3 py-2 border-b border-[#30363d] text-xs font-semibold uppercase text-slate-300">
