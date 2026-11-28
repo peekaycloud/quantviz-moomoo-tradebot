@@ -23,3 +23,9 @@ frontend/dist/
 .DS_Store
 .vscode/
 .idea/
+.vercel
+
+# Deck build output & local tool artifacts
+deck/dist/
+deck/.qoder-office-pptx-locks/
+deck/*.qoder.site
